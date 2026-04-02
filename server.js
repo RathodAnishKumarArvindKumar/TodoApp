@@ -2,76 +2,72 @@ const express = require("express");
 const path = require("path");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const sqlite3 = require("sqlite3").verbose();
+const { Pool } = require("pg");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret-in-production";
+const DATABASE_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
+const needsSsl = DATABASE_URL && !/localhost|127\.0\.0\.1/i.test(DATABASE_URL);
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: needsSsl ? { rejectUnauthorized: false } : false,
+    })
+  : null;
 
-const dbPath = process.env.DB_PATH || path.join(__dirname, "todo.sqlite");
-const db = new sqlite3.Database(dbPath);
+const dbReady = pool
+  ? pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id BIGSERIAL PRIMARY KEY,
+        email TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS todos (
+        id BIGSERIAL PRIMARY KEY,
+        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        completed BOOLEAN NOT NULL DEFAULT FALSE,
+        due_at TIMESTAMPTZ,
+        reminder_sent BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+    `)
+  : Promise.resolve();
 
 app.use(express.json());
 app.use(express.static(__dirname));
 
-db.serialize(() => {
-  db.run(
-    `CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )`
-  );
+async function query(sql, params = []) {
+  if (!pool) {
+    throw new Error("Database is not configured. Set DATABASE_URL before starting the server.");
+  }
 
-  db.run(
-    `CREATE TABLE IF NOT EXISTS todos (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      text TEXT NOT NULL,
-      completed INTEGER NOT NULL DEFAULT 0,
-      due_at TEXT,
-      reminder_sent INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(user_id) REFERENCES users(id)
-    )`
-  );
-});
-
-function runQuery(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function onRun(error) {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve({ id: this.lastID, changes: this.changes });
-    });
-  });
+  await dbReady;
+  return pool.query(sql, params);
 }
 
-function getQuery(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (error, row) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve(row || null);
-    });
-  });
+async function runQuery(sql, params = []) {
+  const result = await query(sql, params);
+  const firstRow = result.rows[0] || null;
+
+  return {
+    id: firstRow?.id ?? null,
+    changes: typeof result.rowCount === "number" ? result.rowCount : 0,
+    row: firstRow,
+  };
 }
 
-function allQuery(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, (error, rows) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve(rows || []);
-    });
-  });
+async function getQuery(sql, params = []) {
+  const result = await query(sql, params);
+  return result.rows[0] || null;
+}
+
+async function allQuery(sql, params = []) {
+  const result = await query(sql, params);
+  return result.rows || [];
 }
 
 function signToken(user) {
@@ -96,6 +92,23 @@ function requireAuth(req, res, next) {
   }
 }
 
+app.use(async (req, res, next) => {
+  if (req.path.startsWith("/api/") && !pool) {
+    res.status(500).json({
+      message: "Database is not configured",
+      detail: "Set DATABASE_URL (or POSTGRES_URL) for this deployment.",
+    });
+    return;
+  }
+
+  try {
+    await dbReady;
+    next();
+  } catch (error) {
+    res.status(500).json({ message: "Database initialization failed", detail: error.message });
+  }
+});
+
 app.post("/api/auth/signup", async (req, res) => {
   try {
     const email = String(req.body.email || "").trim().toLowerCase();
@@ -111,7 +124,7 @@ app.post("/api/auth/signup", async (req, res) => {
       return;
     }
 
-    const existingUser = await getQuery("SELECT id FROM users WHERE email = ?", [email]);
+    const existingUser = await getQuery("SELECT id FROM users WHERE email = $1", [email]);
     if (existingUser) {
       res.status(409).json({ message: "Email already in use" });
       return;
@@ -119,7 +132,7 @@ app.post("/api/auth/signup", async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
     const created = await runQuery(
-      "INSERT INTO users (email, password_hash) VALUES (?, ?)",
+      "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id",
       [email, passwordHash]
     );
 
@@ -142,7 +155,10 @@ app.post("/api/auth/login", async (req, res) => {
       return;
     }
 
-    const userRow = await getQuery("SELECT id, email, password_hash FROM users WHERE email = ?", [email]);
+    const userRow = await getQuery(
+      "SELECT id, email, password_hash FROM users WHERE email = $1",
+      [email]
+    );
     if (!userRow) {
       res.status(401).json({ message: "Invalid credentials" });
       return;
@@ -168,7 +184,7 @@ app.get("/api/todos", requireAuth, async (req, res) => {
     const rows = await allQuery(
       `SELECT id, text, completed, due_at AS dueAt, reminder_sent AS reminderSent
        FROM todos
-       WHERE user_id = ?
+       WHERE user_id = $1
        ORDER BY created_at DESC, id DESC`,
       [req.user.id]
     );
@@ -199,14 +215,15 @@ app.post("/api/todos", requireAuth, async (req, res) => {
 
     const created = await runQuery(
       `INSERT INTO todos (user_id, text, completed, due_at, reminder_sent)
-       VALUES (?, ?, 0, ?, 0)`,
+       VALUES ($1, $2, FALSE, $3, FALSE)
+       RETURNING id`,
       [req.user.id, text, dueAt]
     );
 
     const row = await getQuery(
       `SELECT id, text, completed, due_at AS dueAt, reminder_sent AS reminderSent
        FROM todos
-       WHERE id = ? AND user_id = ?`,
+       WHERE id = $1 AND user_id = $2`,
       [created.id, req.user.id]
     );
 
@@ -233,7 +250,7 @@ app.patch("/api/todos/:id", requireAuth, async (req, res) => {
     const existing = await getQuery(
       `SELECT id, text, completed, due_at AS dueAt, reminder_sent AS reminderSent
        FROM todos
-       WHERE id = ? AND user_id = ?`,
+       WHERE id = $1 AND user_id = $2`,
       [todoId, req.user.id]
     );
 
@@ -245,7 +262,7 @@ app.patch("/api/todos/:id", requireAuth, async (req, res) => {
     const nextText =
       typeof req.body.text === "string" ? req.body.text.trim() || existing.text : existing.text;
     const nextCompleted =
-      typeof req.body.completed === "boolean" ? Number(req.body.completed) : Number(existing.completed);
+      typeof req.body.completed === "boolean" ? req.body.completed : Boolean(existing.completed);
     const nextDueAt =
       Object.prototype.hasOwnProperty.call(req.body, "dueAt")
         ? req.body.dueAt
@@ -254,22 +271,22 @@ app.patch("/api/todos/:id", requireAuth, async (req, res) => {
         : existing.dueAt;
     const nextReminderSent =
       typeof req.body.reminderSent === "boolean"
-        ? Number(req.body.reminderSent)
-        : Number(existing.reminderSent);
+        ? req.body.reminderSent
+        : Boolean(existing.reminderSent);
 
     await runQuery(
       `UPDATE todos
-       SET text = ?, completed = ?, due_at = ?, reminder_sent = ?
-       WHERE id = ? AND user_id = ?`,
+       SET text = $1, completed = $2, due_at = $3, reminder_sent = $4
+       WHERE id = $5 AND user_id = $6`,
       [nextText, nextCompleted, nextDueAt, nextReminderSent, todoId, req.user.id]
     );
 
     res.json({
       id: String(existing.id),
       text: nextText,
-      completed: Boolean(nextCompleted),
+      completed: nextCompleted,
       dueAt: nextDueAt,
-      reminderSent: Boolean(nextReminderSent),
+      reminderSent: nextReminderSent,
     });
   } catch (error) {
     res.status(500).json({ message: "Could not update todo", detail: error.message });
@@ -284,7 +301,7 @@ app.delete("/api/todos/:id", requireAuth, async (req, res) => {
       return;
     }
 
-    const deleted = await runQuery("DELETE FROM todos WHERE id = ? AND user_id = ?", [
+    const deleted = await runQuery("DELETE FROM todos WHERE id = $1 AND user_id = $2", [
       todoId,
       req.user.id,
     ]);
@@ -302,7 +319,7 @@ app.delete("/api/todos/:id", requireAuth, async (req, res) => {
 
 app.delete("/api/todos", requireAuth, async (req, res) => {
   try {
-    await runQuery("DELETE FROM todos WHERE user_id = ? AND completed = 1", [req.user.id]);
+    await runQuery("DELETE FROM todos WHERE user_id = $1 AND completed = TRUE", [req.user.id]);
     res.status(204).send();
   } catch (error) {
     res.status(500).json({ message: "Could not clear completed", detail: error.message });
@@ -317,6 +334,10 @@ app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "login.html"));
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
