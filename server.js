@@ -8,7 +8,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret-in-production";
 
-const dbPath = path.join(__dirname, "todo.sqlite");
+const dbPath = process.env.DB_PATH || path.join(__dirname, "todo.sqlite");
 const db = new sqlite3.Database(dbPath);
 
 app.use(express.json());
