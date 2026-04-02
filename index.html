@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Simple Todo App</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="app">
+    <header class="app-header">
+      <div>
+        <h1>Todo App</h1>
+        <p id="account-email" class="account-email"></p>
+      </div>
+      <button type="button" id="logout-btn" class="logout-btn">Logout</button>
+    </header>
+
+    <form id="todo-form" class="todo-form" autocomplete="off">
+      <label for="todo-input" class="sr-only">New todo</label>
+      <input
+        id="todo-input"
+        type="text"
+        placeholder="What do you need to do?"
+        maxlength="120"
+        required
+      />
+      <label for="todo-due" class="sr-only">Reminder date and time</label>
+      <input id="todo-due" type="datetime-local" />
+      <button type="submit">Add</button>
+    </form>
+
+    <section class="reminder-bar">
+      <button type="button" id="enable-reminders">Enable Notifications</button>
+      <p id="reminder-status" class="reminder-status">Notifications not enabled</p>
+    </section>
+
+    <section class="controls">
+      <button type="button" data-filter="all" class="active">All</button>
+      <button type="button" data-filter="active">Active</button>
+      <button type="button" data-filter="completed">Completed</button>
+      <button type="button" id="clear-completed">Clear Completed</button>
+    </section>
+
+    <ul id="todo-list" class="todo-list" aria-live="polite"></ul>
+
+    <p id="todo-count" class="todo-count">0 items left</p>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
